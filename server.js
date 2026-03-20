@@ -24,6 +24,23 @@ app.use('/hls', express.static(HLS_DIR));
 
 const activeProcesses = new Map();
 
+// Helper function: m3u8 ဖိုင်ကို FFmpeg က ရေးပြီးတာ သေချာမှ လင့်ခ်ကို Redirect လုပ်ပေးရန်
+function waitForFile(filePath, callback) {
+    let retries = 0;
+    const check = setInterval(() => {
+        if (fs.existsSync(filePath) && fs.statSync(filePath).size > 0) {
+            clearInterval(check);
+            callback();
+        } else {
+            retries++;
+            if (retries > 30) { // အများဆုံး ၁၅ စက္ကန့် စောင့်မည်
+                clearInterval(check);
+                callback();
+            }
+        }
+    }, 500);
+}
+
 // အဓိက HLS ပြောင်းပေးမည့် API Endpoint
 app.get('/play', (req, res) => {
     const videoUrl = req.query.url;
@@ -37,9 +54,9 @@ app.get('/play', (req, res) => {
     const m3u8Path = path.join(streamDir, 'index.m3u8');
     const streamUrl = `/hls/${streamId}/index.m3u8`;
 
-    // Process လုပ်နေဆဲ (သို့) .m3u8 ဖိုင် ရှိနေပြီးသားဆိုလျှင် အသစ်ထပ်မလုပ်ဘဲ လင့်ခ်ကိုသာ ပြန်ပေးမည်
+    // Process လုပ်နေဆဲ (သို့) .m3u8 ဖိုင် ရှိနေပြီးသားဆိုလျှင် လင့်ခ်ကိုသာ ပြန်ပေးမည်
     if (fs.existsSync(m3u8Path) || activeProcesses.has(streamId)) {
-        return res.redirect(streamUrl);
+        return waitForFile(m3u8Path, () => res.redirect(streamUrl));
     }
 
     // Stream အတွက် Folder အသစ်တည်ဆောက်ခြင်း
@@ -47,21 +64,29 @@ app.get('/play', (req, res) => {
 
     console.log(`Starting FFmpeg for: ${videoUrl}`);
 
-    // FFmpeg ဖြင့် MP4 ကို HLS သို့ Remux လုပ်ခြင်း (CPU မစားစေရန် -c copy ကိုသာ သုံးထားသည်)
+    // FFmpeg ဖြင့် MP4 ကို HLS သို့ Remux လုပ်ခြင်း
     const command = ffmpeg(videoUrl)
+        // Telegram stream ခဏပြတ်သွားပါက အလိုအလျောက် ပြန်ချိတ်ရန် Input Options များ
+        .inputOptions([
+            '-reconnect 1',
+            '-reconnect_at_eof 1',
+            '-reconnect_streamed 1',
+            '-reconnect_delay_max 5'
+        ])
         .outputOptions([
-            '-c:v copy',        // Video ကို Transcode မလုပ်ဘဲ မူရင်းအတိုင်း ကူးယူရန်
+            '-c:v copy',        // Video ကို Transcode မလုပ်ဘဲ မူရင်းအတိုင်း ကူးယူရန် (CPU မစားစေရန်)
             '-c:a copy',        // Audio ကို Transcode မလုပ်ဘဲ မူရင်းအတိုင်း ကူးယူရန်
             '-hls_time 10',     // တစ်ပိုင်းလျှင် ၁၀ စက္ကန့်ခွဲရန်
             '-hls_list_size 0', // Playlist တွင် အပိုင်းအားလုံးကို ပြရန်
+            '-hls_playlist_type event', // ဤအချက်မှာ အရေးအကြီးဆုံးဖြစ်သည်။ Player မှ ဇာတ်ကား အပိုင်းသစ်များ ဆက်လက်ထွက်နေကြောင်း သိရှိရန်ဖြစ်သည်။
             '-f hls'            // HLS Format အဖြစ်ထုတ်ရန်
         ])
         .output(m3u8Path)
-        .on('start', (cmd) => {
-            console.log('FFmpeg started successfully.');
+        .on('start', () => {
+            console.log('FFmpeg started successfully for:', streamId);
         })
         .on('end', () => {
-            console.log('FFmpeg finished for:', streamId);
+            console.log('FFmpeg finished completely for:', streamId);
             activeProcesses.delete(streamId);
         })
         .on('error', (err) => {
@@ -72,11 +97,11 @@ app.get('/play', (req, res) => {
     activeProcesses.set(streamId, command);
     command.run(); // FFmpeg Process ကို စတင်ပါမည်
 
-    // Command စတင်ပြီးပြီးချင်း HLS URL သို့ Redirect လုပ်ပါမည်။
-    res.redirect(streamUrl);
+    // m3u8 ဖိုင် စတင်ထွက်ပေါ်လာသည်အထိ စောင့်ပြီးမှ Redirect လုပ်ပေးပါမည်
+    waitForFile(m3u8Path, () => res.redirect(streamUrl));
 });
 
-// Server Disk မပြည့်စေရန် ၂ နာရီကျော်သွားသော Stream Folder များကို ဖျက်ပေးမည့် Cron Job
+// Server Disk မပြည့်စေရန် ၂ နာရီကျော်သွားသော Stream Folder များကို ရှင်းလင်းပေးမည့် စနစ်
 setInterval(() => {
     const now = Date.now();
     fs.readdir(HLS_DIR, (err, files) => {
